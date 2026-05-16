@@ -2,8 +2,39 @@ import streamlit as sl
 import pandas as pd
 from datetime import datetime, timedelta
 
-from data.assignment import AssignmentList
-from data.event import EventList
+from logic.scheduler import SmartScheduler, infer_can_split
+
+try:
+    from data.assignment import AssignmentList
+except ModuleNotFoundError:
+    AssignmentList = {}
+
+try:
+    from data.event import EventList
+except ModuleNotFoundError:
+    EventList = {}
+
+WEEKDAY_OPTIONS = [
+    "Every day",
+    "Weekdays",
+    "Weekends",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
+DEFAULT_SCHEDULE_SETTINGS = {
+    "study_start_hour": SmartScheduler.STUDY_HOURS_START,
+    "study_end_hour": SmartScheduler.STUDY_HOURS_END,
+    "days_ahead": SmartScheduler.DAYS_AHEAD,
+    "min_block_minutes": SmartScheduler.MIN_SESSION_DURATION_MINUTES,
+    "max_block_minutes": SmartScheduler.SESSION_DURATION_MINUTES,
+    "buffer_minutes": SmartScheduler.BUFFER_MINUTES,
+    "part_gap_minutes": SmartScheduler.PART_GAP_MINUTES,
+}
 
 
 def _parse_datetime(value):
@@ -84,6 +115,13 @@ def _clean_value(value, default=""):
 def _clean_text(value, default=""):
     value = _clean_value(value, default=default)
     return str(value).strip() if value != "" else default
+
+
+def _preview_text(value, max_chars=120):
+    text = _clean_text(value)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rsplit(" ", 1)[0] + "..."
 
 
 def _number_or_default(value, default=0):
@@ -224,16 +262,22 @@ def _assignment_editor_rows(assignments):
     for index, assignment in enumerate(assignments):
         row_id = assignment.get("id") or f"assignment_{index}"
         assignment["id"] = row_id
+        if "can_split" not in assignment:
+            assignment["can_split"] = infer_can_split(assignment)
         weight = assignment.get("group_weight")
         rows.append({
             "id": row_id,
             "Include": _bool_or_default(assignment.get("include", True)),
+            "Can Split": _bool_or_default(assignment.get("can_split"), default=True),
             "Assignment": assignment.get("title") or assignment.get("name") or "Untitled",
             "Course": assignment.get("course_name") or assignment.get("context") or assignment.get("course") or "Unknown",
             "Due": assignment.get("due_at") or assignment.get("start_at") or "",
             "Points": _number_or_default(assignment.get("points"), default=0),
             "Category": assignment.get("assignment_group_name", "Unweighted"),
             "Category Weight %": assignment.get("group_weight_percent", _weight_percent(weight or 1)),
+            "Instructions Preview": _preview_text(
+                assignment.get("instructions") or assignment.get("description"),
+            ),
         })
     return pd.DataFrame(rows)
 
@@ -264,6 +308,7 @@ def _merge_assignment_edits(assignments, edited_rows):
             continue
 
         include = _bool_or_default(row.get("Include"), default=True)
+        can_split = _bool_or_default(row.get("Can Split"), default=True)
         title = _clean_text(row.get("Assignment"), default="Untitled")
         course = _clean_text(row.get("Course"), default="Unknown")
         due_at = _clean_text(row.get("Due"))
@@ -273,6 +318,7 @@ def _merge_assignment_edits(assignments, edited_rows):
         group_weight_percent = _weight_percent(group_weight)
 
         changed |= _set_if_changed(assignment, "include", include)
+        changed |= _set_if_changed(assignment, "can_split", can_split)
         changed |= _set_if_changed(assignment, "title", title)
         changed |= _set_if_changed(assignment, "course_name", course)
         changed |= _set_if_changed(assignment, "context", course)
@@ -283,6 +329,40 @@ def _merge_assignment_edits(assignments, edited_rows):
         changed |= _set_if_changed(assignment, "group_weight_percent", group_weight_percent)
 
     return changed
+
+
+def _assignment_label(assignment):
+    title = assignment.get("title") or assignment.get("name") or "Untitled"
+    course = assignment.get("course_name") or assignment.get("context") or assignment.get("course") or "Unknown"
+    return f"{title} ({course})"
+
+
+def _render_assignment_instructions_editor(assignments, version):
+    by_id = {assignment.get("id"): assignment for assignment in assignments}
+    assignment_ids = [assignment.get("id") for assignment in assignments if assignment.get("id")]
+    if not assignment_ids:
+        return
+
+    selected_id = sl.selectbox(
+        "Assignment instructions",
+        assignment_ids,
+        format_func=lambda item_id: _assignment_label(by_id[item_id]),
+        key=f"assignment_instructions_select_{version}",
+    )
+    assignment = by_id.get(selected_id)
+    if assignment is None:
+        return
+
+    current = assignment.get("instructions") or assignment.get("description") or ""
+    edited = sl.text_area(
+        "Instructions",
+        value=current,
+        height=220,
+        key=f"assignment_instructions_{version}_{selected_id}",
+    )
+    if _set_if_changed(assignment, "instructions", edited):
+        assignment["description"] = edited
+        sl.session_state.processed_schedule = None
 
 
 def _merge_event_edits(events, edited_rows):
@@ -349,15 +429,18 @@ def _render_editable_workload(raw_data):
             num_rows="fixed",
             column_order=[
                 "Include",
+                "Can Split",
                 "Assignment",
                 "Course",
                 "Due",
                 "Points",
                 "Category",
                 "Category Weight %",
+                "Instructions Preview",
             ],
             column_config={
                 "Include": sl.column_config.CheckboxColumn("Include"),
+                "Can Split": sl.column_config.CheckboxColumn("Can Split"),
                 "Points": sl.column_config.NumberColumn("Points", min_value=0, step=1),
                 "Category Weight %": sl.column_config.NumberColumn(
                     "Category Weight %",
@@ -365,10 +448,17 @@ def _render_editable_workload(raw_data):
                     max_value=100,
                     step=0.1,
                 ),
+                "Instructions Preview": sl.column_config.TextColumn(
+                    "Instructions Preview",
+                    disabled=True,
+                    width="large",
+                ),
             },
         )
         if _merge_assignment_edits(assignments, edited_assignments.to_dict("records")):
             sl.session_state.processed_schedule = None
+
+        _render_assignment_instructions_editor(assignments, version)
 
         included = sum(1 for assignment in assignments if assignment.get("include", True))
         sl.caption(f"{included} of {len(assignments)} assignments included in scheduler calculations.")
@@ -425,11 +515,19 @@ def _render_schedule(schedule):
             "Study Block": event.get("title", "Study block"),
             "Start": _format_datetime(event.get("start_at")),
             "End": _format_datetime(event.get("end_at")),
+            "Minutes": event.get("planned_minutes", ""),
             "Target Calendar": event.get("calendar_id", "Personal"),
             "Canvas Event ID": event.get("pushed_canvas_event_id", ""),
             "Details": event.get("description", ""),
         })
     sl.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def _render_unscheduled_assignments(items):
+    if not items:
+        return
+    sl.warning(f"{len(items)} assignment(s) have estimated work that could not be fully scheduled.")
+    sl.dataframe(items, use_container_width=True, hide_index=True)
 
 
 def _render_canvas_sync_result(result):
@@ -459,6 +557,142 @@ def _render_canvas_sync_result(result):
             sl.caption(f"{len(deleted)} generated block(s) deleted.")
         if failed:
             sl.dataframe(failed, use_container_width=True, hide_index=True)
+
+
+def _schedule_settings():
+    settings = dict(DEFAULT_SCHEDULE_SETTINGS)
+    settings.update(sl.session_state.get("schedule_settings", {}))
+    return settings
+
+
+def _setting_number(label, value, minimum, maximum, step, key):
+    return int(sl.number_input(label, min_value=minimum, max_value=maximum, value=int(value), step=step, key=key))
+
+
+def _render_schedule_settings():
+    settings = _schedule_settings()
+
+    col1, col2 = sl.columns(2)
+    with col1:
+        study_start_hour = _setting_number(
+            "Study start hour",
+            settings["study_start_hour"],
+            0,
+            23,
+            1,
+            "setting_study_start_hour",
+        )
+        min_block_minutes = _setting_number(
+            "Minimum block minutes",
+            settings["min_block_minutes"],
+            15,
+            240,
+            15,
+            "setting_min_block_minutes",
+        )
+        buffer_minutes = _setting_number(
+            "Buffer minutes",
+            settings["buffer_minutes"],
+            0,
+            120,
+            5,
+            "setting_buffer_minutes",
+        )
+    with col2:
+        study_end_hour = _setting_number(
+            "Study end hour",
+            settings["study_end_hour"],
+            1,
+            24,
+            1,
+            "setting_study_end_hour",
+        )
+        max_block_minutes = _setting_number(
+            "Maximum split block minutes",
+            settings["max_block_minutes"],
+            30,
+            360,
+            15,
+            "setting_max_block_minutes",
+        )
+        part_gap_minutes = _setting_number(
+            "Gap between assignment parts",
+            settings["part_gap_minutes"],
+            0,
+            1440,
+            15,
+            "setting_part_gap_minutes",
+        )
+
+    days_ahead = _setting_number(
+        "Scheduling horizon days",
+        settings["days_ahead"],
+        1,
+        30,
+        1,
+        "setting_days_ahead",
+    )
+
+    new_settings = {
+        "study_start_hour": study_start_hour,
+        "study_end_hour": study_end_hour,
+        "days_ahead": days_ahead,
+        "min_block_minutes": min_block_minutes,
+        "max_block_minutes": max(max_block_minutes, min_block_minutes),
+        "buffer_minutes": buffer_minutes,
+        "part_gap_minutes": part_gap_minutes,
+    }
+    if new_settings != sl.session_state.get("schedule_settings"):
+        sl.session_state.schedule_settings = new_settings
+        sl.session_state.processed_schedule = None
+
+
+def _blocked_time_rows():
+    rows = sl.session_state.get("custom_blocked_times", [])
+    return pd.DataFrame(
+        rows,
+        columns=["Include", "Name", "Day", "Start", "End"],
+    )
+
+
+def _normalize_blocked_rows(records):
+    normalized = []
+    for row in records:
+        name = _clean_text(row.get("Name"), default="Blocked")
+        day = _clean_text(row.get("Day"), default="Every day")
+        start = _clean_text(row.get("Start"))
+        end = _clean_text(row.get("End"))
+        if not start and not end:
+            continue
+        normalized.append({
+            "Include": _bool_or_default(row.get("Include"), default=True),
+            "Name": name,
+            "Day": day if day in WEEKDAY_OPTIONS else "Every day",
+            "Start": start,
+            "End": end,
+        })
+    return normalized
+
+
+def _render_blocked_time_settings():
+    edited = sl.data_editor(
+        _blocked_time_rows(),
+        key="custom_blocked_time_editor",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_order=["Include", "Name", "Day", "Start", "End"],
+        column_config={
+            "Include": sl.column_config.CheckboxColumn("Include", default=True),
+            "Day": sl.column_config.SelectboxColumn("Day", options=WEEKDAY_OPTIONS, default="Every day"),
+            "Start": sl.column_config.TextColumn("Start"),
+            "End": sl.column_config.TextColumn("End"),
+        },
+    )
+    rows = _normalize_blocked_rows(edited.to_dict("records"))
+    if rows != sl.session_state.get("custom_blocked_times", []):
+        sl.session_state.custom_blocked_times = rows
+        sl.session_state.processed_schedule = None
 
 
 def ViewDashboard(
@@ -498,6 +732,7 @@ def ViewDashboard(
 
         schedule = sl.session_state.get("processed_schedule")
         _render_schedule(schedule)
+        _render_unscheduled_assignments(sl.session_state.get("unscheduled_assignments"))
 
         if schedule:
             col1, col2 = sl.columns(2)
@@ -511,6 +746,12 @@ def ViewDashboard(
         _render_canvas_sync_result(sl.session_state.get("canvas_sync_result"))
 
     with tab3:
+        sl.header("Scheduler Settings")
+        _render_schedule_settings()
+
+        sl.header("Blocked Time")
+        _render_blocked_time_settings()
+
         if sl.button("Clear Session"):
             sl.session_state.clear()
             sl.rerun()
