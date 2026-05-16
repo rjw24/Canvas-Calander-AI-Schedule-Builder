@@ -1,0 +1,49 @@
+# ----------------------
+# Virtual Environments
+# ----------------------
+.venv/
+venv/
+env/
+
+# ----------------------
+# Python cache files
+# ----------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ----------------------
+# Distribution / packaging
+# ----------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ----------------------
+# Environment variables
+# ----------------------
+.env
+.env.*
+
+# ----------------------
+# Streamlit cache
+# ----------------------
+.streamlit/secrets.toml
+
+# ----------------------
+# VS Code
+# ----------------------
+.vscode/
+
+# ----------------------
+# OS files
+# ----------------------
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# Logs
+# ----------------------
+*.log
+.codex
